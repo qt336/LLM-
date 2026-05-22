@@ -987,12 +987,27 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
 
         self.exp_clip = float(getattr(self.config, "attn_ssm_exp_clip", 20.0))
         self.center_positions = bool(getattr(self.config, "attn_ssm_center_positions", True))
-        self.sink_anchor_positions = bool(getattr(self.config, "attn_ssm_sink_anchor_positions", False))
+        self.sink_no_decay = bool(
+            getattr(self.config, "attn_ssm_sink_no_decay", False)
+            or getattr(self.config, "attn_ssm_sink_anchor_positions", False)
+        )
+        self.sink_no_decay_mode = str(getattr(self.config, "attn_ssm_sink_no_decay_mode", "exact")).lower()
+        if self.sink_no_decay_mode not in {"exact", "approx"}:
+            raise ValueError(
+                "attn_ssm_sink_no_decay_mode must be one of {'exact', 'approx'}, "
+                f"got {self.sink_no_decay_mode!r}"
+            )
+
+    @property
+    def sink_no_decay_exact(self) -> bool:
+        return self.sink_no_decay and self.sink_no_decay_mode == "exact"
+
+    @property
+    def sink_no_decay_approx(self) -> bool:
+        return self.sink_no_decay and self.sink_no_decay_mode == "approx"
 
     def _positions(self, seq_len: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(seq_len, device=device, dtype=torch.float32)
-        if self.sink_anchor_positions:
-            return pos
         if self.center_positions:
             pos = pos - (seq_len - 1) / 2.0
         return pos
@@ -1009,18 +1024,14 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
 
         a = torch.exp(exponent_q).to(dtype=dtype)
         c = torch.exp(exponent_k).to(dtype=dtype)
+        if self.sink_no_decay_approx and pos.numel() > 0:
+            sink_exponent = pos[-1] / tau
+            if self.exp_clip > 0:
+                sink_exponent = sink_exponent.clamp(-self.exp_clip, self.exp_clip)
+            c[:, 0, :, :] = torch.exp(sink_exponent).to(dtype=dtype)
         return a, c
 
-    def apply_to_qk(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        all_len: int,
-        layer_idx: Optional[int] = None,
-        use_rope_cache: bool = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del layer_idx, use_rope_cache
-
+    def _validate_qk(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[int, int]:
         if q.dim() != 4 or k.dim() != 4:
             raise ValueError("AttnSSMRotaryEmbedding expects q and k with shape [B, H, T, D]")
         if q.size(1) != self.config.n_heads:
@@ -1039,22 +1050,25 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
 
         q_len = q.size(-2)
         k_len = k.size(-2)
-
         if q_len != k_len:
             raise ValueError(
                 "AttnSSMRotaryEmbedding only supports q_len == k_len to match the "
                 f"original implementation, but got q_len={q_len}, k_len={k_len}"
             )
+        return q_len, k_len
 
-        q_ = q.float() if self.config.rope_full_precision else q
-        k_ = k.float() if self.config.rope_full_precision else k
-
-        pos = self._positions(q_len, q_.device)
-        a, c = self._position_factors(pos, q_.dtype)
+    def _decompose_qk(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_len = q.size(-2)
+        k_len = k.size(-2)
         pair_count = self.num_head_pairs * 2
-
-        q_pairs = q_[:, :pair_count, :, :].transpose(1, 2).reshape(q_.size(0), q_len, self.num_head_pairs, 2, self.head_dim)
-        k_pairs = k_[:, :pair_count, :, :].transpose(1, 2).reshape(k_.size(0), k_len, self.num_head_pairs, 2, self.head_dim)
+        q_pairs = q[:, :pair_count, :, :].transpose(1, 2).reshape(
+            q.size(0), q_len, self.num_head_pairs, 2, self.head_dim
+        )
+        k_pairs = k[:, :pair_count, :, :].transpose(1, 2).reshape(
+            k.size(0), k_len, self.num_head_pairs, 2, self.head_dim
+        )
 
         q_left, q_right = q_pairs[..., 0, :], q_pairs[..., 1, :]
         k_left, k_right = k_pairs[..., 0, :], k_pairs[..., 1, :]
@@ -1067,27 +1081,127 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
             q_disp = q_right
         k_avg = 0.5 * (k_left + k_right)
         k_disp = 0.5 * (k_left - k_right)
+        return q_avg, q_disp, k_avg, k_disp
 
-        eta = self.eta.to(device=q_.device, dtype=torch.float32).clamp_min(0.0)
-        eta_sqrt = torch.sqrt(eta).to(dtype=q_.dtype).view(1, 1, self.num_head_pairs, 1)
+    def _eta_sqrt(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        eta = self.eta.to(device=device, dtype=torch.float32).clamp_min(0.0)
+        return torch.sqrt(eta).to(dtype=dtype).view(1, 1, self.num_head_pairs, 1)
 
-        q_avg = q_avg * a
-        k_avg = k_avg * c
-        q_disp = q_disp * a * eta_sqrt
-        k_disp = k_disp * c * eta_sqrt
+    def _apply_position_factors(
+        self,
+        q_avg: torch.Tensor,
+        q_disp: torch.Tensor,
+        k_avg: torch.Tensor,
+        k_disp: torch.Tensor,
+        a: torch.Tensor,
+        c: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        eta_sqrt = self._eta_sqrt(q_avg.device, q_avg.dtype)
+        return (
+            q_avg * a,
+            q_disp * a * eta_sqrt,
+            k_avg * c,
+            k_disp * c * eta_sqrt,
+        )
+
+    def _rebuild_qk_heads(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_avg: torch.Tensor,
+        q_disp: torch.Tensor,
+        k_avg: torch.Tensor,
+        k_disp: torch.Tensor,
+        q_dtype: torch.dtype,
+        k_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_len = q.size(-2)
+        k_len = k.size(-2)
+        pair_count = self.num_head_pairs * 2
 
         q_aug = torch.stack([q_avg, q_disp], dim=3).permute(0, 2, 3, 1, 4).reshape(
-            q_.size(0), pair_count, q_len, self.head_dim
+            q.size(0), pair_count, q_len, self.head_dim
         )
         k_aug = torch.stack([k_avg, k_disp], dim=3).permute(0, 2, 3, 1, 4).reshape(
-            k_.size(0), pair_count, k_len, self.head_dim
+            k.size(0), pair_count, k_len, self.head_dim
         )
 
         if self.has_odd_head:
-            q_aug = torch.cat([q_aug, q_[:, -1:, :, :]], dim=1)
-            k_aug = torch.cat([k_aug, k_[:, -1:, :, :]], dim=1)
+            q_aug = torch.cat([q_aug, q[:, -1:, :, :]], dim=1)
+            k_aug = torch.cat([k_aug, k[:, -1:, :, :]], dim=1)
 
-        return q_aug.to(dtype=q.dtype), k_aug.to(dtype=k.dtype)
+        return q_aug.to(dtype=q_dtype), k_aug.to(dtype=k_dtype)
+
+    def _sink_logits_from_raw_components(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_avg: torch.Tensor,
+        q_disp: torch.Tensor,
+        k_avg: torch.Tensor,
+        k_disp: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        sink_avg = (q_avg * k_avg[:, :1, :, :]).sum(dim=-1)
+        eta = self.eta.to(device=q.device, dtype=torch.float32).clamp_min(0.0).to(dtype=q.dtype)
+        sink_disp = (q_disp * k_disp[:, :1, :, :]).sum(dim=-1) * eta.view(1, 1, self.num_head_pairs)
+
+        pair_count = self.num_head_pairs * 2
+        sink_logits = torch.stack([sink_avg, sink_disp], dim=3).permute(0, 2, 3, 1).reshape(
+            q.size(0), pair_count, q.size(-2)
+        )
+        if self.has_odd_head:
+            sink_odd = (q[:, -1:, :, :] * k[:, -1:, :1, :]).sum(dim=-1)
+            sink_logits = torch.cat([sink_logits, sink_odd], dim=1)
+        return sink_logits.to(dtype=dtype)
+
+    def apply_to_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        all_len: int,
+        layer_idx: Optional[int] = None,
+        use_rope_cache: bool = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del all_len, layer_idx, use_rope_cache
+
+        q_len, _ = self._validate_qk(q, k)
+        q_ = q.float() if self.config.rope_full_precision else q
+        k_ = k.float() if self.config.rope_full_precision else k
+
+        pos = self._positions(q_len, q_.device)
+        a, c = self._position_factors(pos, q_.dtype)
+        q_avg, q_disp, k_avg, k_disp = self._decompose_qk(q_, k_)
+        q_avg, q_disp, k_avg, k_disp = self._apply_position_factors(
+            q_avg, q_disp, k_avg, k_disp, a, c
+        )
+
+        return self._rebuild_qk_heads(q_, k_, q_avg, q_disp, k_avg, k_disp, q.dtype, k.dtype)
+
+    def apply_to_qk_with_sink_logits(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        all_len: int,
+        layer_idx: Optional[int] = None,
+        use_rope_cache: bool = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del all_len, layer_idx, use_rope_cache
+
+        q_len, _ = self._validate_qk(q, k)
+        q_ = q.float() if self.config.rope_full_precision else q
+        k_ = k.float() if self.config.rope_full_precision else k
+
+        pos = self._positions(q_len, q_.device)
+        a, c = self._position_factors(pos, q_.dtype)
+        q_avg, q_disp, k_avg, k_disp = self._decompose_qk(q_, k_)
+        sink_logits = self._sink_logits_from_raw_components(q_, k_, q_avg, q_disp, k_avg, k_disp, q.dtype)
+        q_avg, q_disp, k_avg, k_disp = self._apply_position_factors(
+            q_avg, q_disp, k_avg, k_disp, a, c
+        )
+        q_aug, k_aug = self._rebuild_qk_heads(q_, k_, q_avg, q_disp, k_avg, k_disp, q.dtype, k.dtype)
+
+        return q_aug, k_aug, sink_logits
 
 
 class FourierEmbedding(RotaryEmbedding):
@@ -1533,11 +1647,49 @@ class OLMoBlock(nn.Module):
         is_causal: bool = False,
         max_doc_len: Optional[int] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
+        sink_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Computes scaled dot product attention on query, key and value tensors, using an optional
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
+        if sink_logits is not None:
+            if max_doc_len is not None or cu_doc_lens is not None:
+                raise NotImplementedError(
+                    "attn_ssm exact sink no-decay is not implemented with document-masked attention"
+                )
+
+            assert k.size(1) == v.size(1)
+            num_kv_heads = k.size(1)
+            num_q_heads = q.size(1)
+            if num_q_heads != num_kv_heads:
+                assert num_q_heads % num_kv_heads == 0
+                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+
+            if sink_logits.shape != q.shape[:3]:
+                raise ValueError(
+                    "sink_logits must have shape [B, H, T], "
+                    f"got {tuple(sink_logits.shape)} for q shape {tuple(q.shape)}"
+                )
+
+            query_len, key_len = q.shape[-2], k.shape[-2]
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+            attn_weights[..., 0] = sink_logits.to(dtype=attn_weights.dtype) / math.sqrt(q.size(-1))
+
+            if is_causal:
+                assert attn_mask is None
+                attn_bias = get_causal_attention_bias(self.__cache, key_len, q.device)[
+                    :, :, key_len - query_len : key_len, :key_len
+                ]
+                attn_weights = attn_weights + attn_bias.to(dtype=attn_weights.dtype)
+            elif attn_mask is not None:
+                attn_weights = attn_weights + attn_mask.to(dtype=attn_weights.dtype)
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(q.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=dropout_p)
+            return torch.matmul(attn_weights, v)
+
         if max_doc_len is not None and cu_doc_lens is not None:
             if q.size(-1) != k.size(-1) or q.size(-1) != v.size(-1):
                 raise ValueError(
@@ -1632,18 +1784,34 @@ class OLMoBlock(nn.Module):
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
 
         all_len = max(query_len, key_len)
+        sink_logits = None
         
         if self.config.pos_emb and (self.config.rope or self.config.fourier):
-            q, k = self.pos_emb.apply_to_qk(
-                q,
-                k,
-                all_len,
-                layer_idx=layer_idx,
-                use_rope_cache=use_rope_cache,
-            )
+            if isinstance(self.pos_emb, AttnSSMRotaryEmbedding) and self.pos_emb.sink_no_decay_exact:
+                if max_doc_len is not None or cu_doc_lens is not None:
+                    raise NotImplementedError(
+                        "attn_ssm exact sink no-decay is not implemented with document-masked attention"
+                    )
+                q, k, sink_logits = self.pos_emb.apply_to_qk_with_sink_logits(
+                    q,
+                    k,
+                    all_len,
+                    layer_idx=layer_idx,
+                    use_rope_cache=use_rope_cache,
+                )
+            else:
+                q, k = self.pos_emb.apply_to_qk(
+                    q,
+                    k,
+                    all_len,
+                    layer_idx=layer_idx,
+                    use_rope_cache=use_rope_cache,
+                )
 
         if self.attention_logit_scale != 1.0:
             q = q * self.attention_logit_scale
+            if sink_logits is not None:
+                sink_logits = sink_logits * self.attention_logit_scale
 
         if attention_bias is not None:
             # Resize and cast attention bias.
@@ -1665,6 +1833,7 @@ class OLMoBlock(nn.Module):
             is_causal=attention_bias is None,
             max_doc_len=max_doc_len,
             cu_doc_lens=cu_doc_lens,
+            sink_logits=sink_logits,
         ) # shape: (B, nh, T, hs)
         
         if self.out_norm is not None:
@@ -1927,7 +2096,45 @@ class OLMoLlamaBlock(OLMoBlock):
         is_causal: bool = False,
         max_doc_len: Optional[int] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
+        sink_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if sink_logits is not None:
+            if max_doc_len is not None or cu_doc_lens is not None:
+                raise NotImplementedError(
+                    "attn_ssm exact sink no-decay is not implemented with document-masked attention"
+                )
+
+            assert k.size(1) == v.size(1)
+            num_kv_heads = k.size(1)
+            num_q_heads = q.size(1)
+            if num_q_heads != num_kv_heads:
+                assert num_q_heads % num_kv_heads == 0
+                k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+                v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
+
+            if sink_logits.shape != q.shape[:3]:
+                raise ValueError(
+                    "sink_logits must have shape [B, H, T], "
+                    f"got {tuple(sink_logits.shape)} for q shape {tuple(q.shape)}"
+                )
+
+            query_len, key_len = q.shape[-2], k.shape[-2]
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+            attn_weights[..., 0] = sink_logits.to(dtype=attn_weights.dtype) / math.sqrt(q.size(-1))
+
+            if is_causal:
+                assert attn_mask is None
+                attn_bias = get_causal_attention_bias(self.__cache, key_len, q.device)[
+                    :, :, key_len - query_len : key_len, :key_len
+                ]
+                attn_weights = attn_weights + attn_bias.to(dtype=attn_weights.dtype)
+            elif attn_mask is not None:
+                attn_weights = attn_weights + attn_mask.to(dtype=attn_weights.dtype)
+
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(q.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=dropout_p)
+            return torch.matmul(attn_weights, v)
+
         if max_doc_len is not None or cu_doc_lens is not None:
             raise NotImplementedError(
                 f"attention document masking is not implemented for {self.__class__.__name__}"

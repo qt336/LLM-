@@ -1,4 +1,4 @@
-run_name: OLMo-60M-ce-512-attn-ssm-c4
+run_name: OLMo-60M-ce-512-attn-ssm-sink-no-decay-c4
 seed: 6198
 dry_run: false
 
@@ -19,7 +19,8 @@ model:
   fourier: false
   flash_attention: true
   attention_dropout: 0.0
-  attention_layer_norm: false
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
   clip_qkv: null
   include_bias: false
   block_type: sequential
@@ -27,7 +28,6 @@ model:
   layer_norm_with_affine: true
   layer_norm_eps: 1e-6
   bias_for_layer_norm: false
-  attention_layer_norm_with_affine: false
   activation_type: swiglu
   residual_dropout: 0.0
   embedding_dropout: 0.0
@@ -38,17 +38,19 @@ model:
   pad_token_id: 1
   init_device: cuda
   init_fn: normal
-  init_std: 0.02
+  init_std: 0.001
   init_cutoff_factor: 3
   attn_ssm_tau_min: 8.0
-  attn_ssm_tau_ratio: 1.25
-  attn_ssm_pair_tau_ratio: 1.25
+  attn_ssm_tau_ratio: 1.323170478
+  attn_ssm_pair_tau_ratio: 0.975
   attn_ssm_tau_max: null
   attn_ssm_disparity_eta: 1.0
   attn_ssm_learn_eta: false
   attn_ssm_exp_clip: 20.0
-  attn_ssm_center_positions: true
+  attn_ssm_center_positions: false
+  attn_ssm_sink_no_decay: false
 
+  
 ddp:
   grad_sync_mode: batch
   find_unused_params: false

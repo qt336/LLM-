@@ -525,10 +525,22 @@ class ModelConfig(BaseConfig):
     attn_ssm positional modulation.
     """
 
+    attn_ssm_sink_no_decay: bool = False
+    """
+    If ``True``, keep the first key position undecayed for every query in
+    attn_ssm positional modulation.
+    """
+
+    attn_ssm_sink_no_decay_mode: str = "exact"
+    """
+    Sink no-decay handling mode for attn_ssm. Supported values are ``exact``
+    and ``approx``.
+    """
+
     attn_ssm_sink_anchor_positions: bool = False
     """
-    If ``True``, keep position 0 fixed as a sink anchor in attn_ssm positional
-    modulation. This takes precedence over ``attn_ssm_center_positions``.
+    Deprecated compatibility alias for sink handling in attn_ssm positional
+    modulation.
     """
     
     fourier: bool = False
@@ -837,6 +849,23 @@ class ModelConfig(BaseConfig):
                 raise OLMoConfigurationError(
                     "You can't set `multi_query_attention` and `n_kv_heads` at the same time."
                 )
+
+    @classmethod
+    def update_legacy_settings(cls, config: D) -> D:
+        new_config = config.copy()
+        if om.is_dict(new_config):
+            assert isinstance(new_config, DictConfig)
+
+            if (
+                hasattr(new_config, "attn_ssm_sink_anchor_positions")
+                and bool(new_config.attn_ssm_sink_anchor_positions)
+            ):
+                if not hasattr(new_config, "attn_ssm_sink_no_decay"):
+                    new_config.attn_ssm_sink_no_decay = True
+                if not hasattr(new_config, "attn_ssm_sink_no_decay_mode"):
+                    new_config.attn_ssm_sink_no_decay_mode = "exact"
+
+        return new_config
 
 
 class OptimizerType(StrEnum):
@@ -1637,5 +1666,8 @@ class TrainConfig(BaseConfig):
 
             if hasattr(new_config, "optimizer"):
                 new_config.optimizer = OptimizerConfig.update_legacy_settings(new_config.optimizer)
+
+            if hasattr(new_config, "model"):
+                new_config.model = ModelConfig.update_legacy_settings(new_config.model)
 
         return new_config
