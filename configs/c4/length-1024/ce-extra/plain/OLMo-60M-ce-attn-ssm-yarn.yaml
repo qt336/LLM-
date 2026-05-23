@@ -32,7 +32,7 @@ model:
   activation_type: swiglu
   residual_dropout: 0.0
   embedding_dropout: 0.0
-  max_sequence_length: 512
+  max_sequence_length: 1024
   vocab_size: 50280
   embedding_size: 50304
   eos_token_id: 0
@@ -42,7 +42,7 @@ model:
   init_std: 0.001
   init_cutoff_factor: 3
   attn_ssm_tau_min: 8.0
-  attn_ssm_tau_ratio: 1.25
+  attn_ssm_tau_ratio: 1
   attn_ssm_pair_tau_ratio: 0.95
   attn_ssm_tau_max: null
   attn_ssm_disparity_eta: 1.0

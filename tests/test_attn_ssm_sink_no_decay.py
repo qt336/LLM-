@@ -3,11 +3,11 @@ import math
 import torch
 
 from olmo.config import ModelConfig, TrainConfig
-from olmo.model import AttnSSMRotaryEmbedding, BufferCache, OLMoSequentialBlock
+from olmo.model import AttnSSMRotaryEmbedding, AttnSSMXPosRotaryEmbedding, BufferCache, OLMoSequentialBlock
 
 
 def _attn_ssm_config(**overrides) -> ModelConfig:
-    return ModelConfig(
+    kwargs = dict(
         d_model=16,
         n_heads=4,
         n_layers=1,
@@ -19,12 +19,20 @@ def _attn_ssm_config(**overrides) -> ModelConfig:
         attention_dropout=0.0,
         residual_dropout=0.0,
         embedding_dropout=0.0,
-        **overrides,
     )
+    kwargs.update(overrides)
+    return ModelConfig(**kwargs)
 
 
 def _attn_ssm_embedding(**overrides) -> AttnSSMRotaryEmbedding:
     return AttnSSMRotaryEmbedding(_attn_ssm_config(**overrides), BufferCache())
+
+
+def _attn_ssm_xpos_embedding(**overrides) -> AttnSSMXPosRotaryEmbedding:
+    return AttnSSMXPosRotaryEmbedding(
+        _attn_ssm_config(rope_variant="attn_ssm_xpos", **overrides),
+        BufferCache(),
+    )
 
 
 def test_default_attn_ssm_positions_match_centered_behavior():
@@ -162,3 +170,36 @@ def test_default_attn_ssm_yaml_keeps_sink_no_decay_disabled():
 
     assert cfg.model.attn_ssm_sink_no_decay is False
     assert cfg.model.attn_ssm_sink_no_decay_mode == "exact"
+
+
+def test_attn_ssm_xpos_factors_follow_relative_xpos_schedule():
+    embedding = _attn_ssm_xpos_embedding(
+        attn_ssm_center_positions=False,
+        attn_ssm_xpos_scale_base=8.0,
+        attn_ssm_exp_clip=0.01,
+    )
+    pos = embedding._positions(5, torch.device("cpu"))
+
+    a, c = embedding._position_factors(pos, torch.float32)
+
+    scale = embedding.xpos_scale.view(1, 1, 1, embedding.head_dim)
+    exponent = pos.view(1, -1, 1, 1) / embedding.xpos_scale_base
+    expected_a = scale.pow(exponent).expand_as(a)
+    expected_c = scale.pow(-exponent).expand_as(c)
+    relative = a[:, -1:, :, :] * c[:, :1, :, :]
+    expected_relative = scale.pow((pos[-1] - pos[0]) / embedding.xpos_scale_base).expand_as(relative)
+
+    assert torch.allclose(a, expected_a)
+    assert torch.allclose(c, expected_c)
+    assert torch.allclose(relative, expected_relative)
+
+
+def test_attn_ssm_xpos_variant_builds_block():
+    config = _attn_ssm_config(
+        block_type="sequential",
+        rope_variant="attn_ssm_xpos",
+        attn_ssm_xpos_scale_base=16.0,
+    )
+    block = OLMoSequentialBlock(0, config, BufferCache())
+
+    assert isinstance(block.pos_emb, AttnSSMXPosRotaryEmbedding)

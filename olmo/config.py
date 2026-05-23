@@ -335,7 +335,7 @@ class ModelConfig(BaseConfig):
     rope_variant: str = "rope"
     """
     Rotary embedding variant. Supported values include ``rope``, ``mixedpe``,
-    and ``attn_ssm``.
+    ``attn_ssm``, and ``attn_ssm_xpos``.
     """
 
     rope_extend_position: Optional[float] = None
@@ -541,6 +541,11 @@ class ModelConfig(BaseConfig):
     """
     Deprecated compatibility alias for sink handling in attn_ssm positional
     modulation.
+    """
+
+    attn_ssm_xpos_scale_base: float = 512.0
+    """
+    Scale base used by the XPos-style AttnSSM positional modulation.
     """
     
     fourier: bool = False

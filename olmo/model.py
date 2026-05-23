@@ -3,7 +3,6 @@ Adapted from
 [MosaiclML](https://github.com/mosaicml/examples.git) and
 [minGPT](https://github.com/karpathy/minGPT.git)
 """
-
 from __future__ import annotations
 
 import logging
@@ -64,6 +63,7 @@ __all__ = [
     "RotaryEmbedding",
     "MixedRotaryEmbedding",
     "AttnSSMRotaryEmbedding",
+    "AttnSSMXPosRotaryEmbedding",
     "FourierEmbedding",
     "Activation",
     "GELU",
@@ -284,6 +284,30 @@ def _attention_logit_scale(config: ModelConfig) -> float:
     if bool(getattr(config, "attention_use_yarn_temperature", False)):
         scale *= _yarn_attention_factor(config)
     return float(scale)
+
+
+def _attn_ssm_tau(config: ModelConfig, head_dim: int, num_head_pairs: int, device: torch.device) -> torch.Tensor:
+    dim_idx = torch.arange(head_dim, dtype=torch.float32, device=device)
+    z_group_idx = torch.floor(dim_idx / 2.0)
+
+    tau_min = float(getattr(config, "attn_ssm_tau_min", 8.0))
+    tau_ratio = float(getattr(config, "attn_ssm_tau_ratio", 1.25))
+    pair_tau_ratio = float(getattr(config, "attn_ssm_pair_tau_ratio", 1.0))
+
+    tau_dim = tau_min * (tau_ratio ** z_group_idx)
+    pair_idx = torch.arange(num_head_pairs, dtype=torch.float32, device=device)
+    tau_pair = pair_tau_ratio ** pair_idx
+    tau = tau_pair[:, None] * tau_dim[None, :]
+
+    tau_max = getattr(config, "attn_ssm_tau_max", None)
+    if tau_max is not None:
+        tau = tau.clamp_max(float(tau_max))
+    return tau.clamp_min(1e-4)
+
+
+def _attn_ssm_eta(config: ModelConfig, num_head_pairs: int, device: torch.device) -> torch.Tensor:
+    eta_init = float(getattr(config, "attn_ssm_disparity_eta", 1.0))
+    return torch.full((num_head_pairs,), eta_init, device=device, dtype=torch.float32)
 
 
 class Dropout(nn.Dropout):
@@ -960,30 +984,19 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
         if self.num_head_pairs < 1:
             raise ValueError("rope_variant='attn_ssm' requires at least 2 attention heads")
 
-        dim_idx = torch.arange(self.head_dim, dtype=torch.float32, device=_non_meta_init_device(self.config))
-        z_group_idx = torch.floor(dim_idx / 2.0)
+        tau = _attn_ssm_tau(
+            self.config,
+            self.head_dim,
+            self.num_head_pairs,
+            _non_meta_init_device(self.config),
+        )
+        self.tau = tau
 
-        tau_min = float(getattr(self.config, "attn_ssm_tau_min", 8.0))
-        tau_ratio = float(getattr(self.config, "attn_ssm_tau_ratio", 1.25))
-        pair_tau_ratio = float(getattr(self.config, "attn_ssm_pair_tau_ratio", 1.0))
-
-        tau_dim = tau_min * (tau_ratio ** z_group_idx)
-        pair_idx = torch.arange(self.num_head_pairs, dtype=torch.float32, device=_non_meta_init_device(self.config))
-        tau_pair = pair_tau_ratio ** pair_idx
-        tau = tau_pair[:, None] * tau_dim[None, :]
-
-        tau_max = getattr(self.config, "attn_ssm_tau_max", None)
-        if tau_max is not None:
-            tau = tau.clamp_max(float(tau_max))
-        tau = tau.clamp_min(1e-4)
-        self.register_buffer("tau", tau, persistent=True)
-
-        eta_init = float(getattr(self.config, "attn_ssm_disparity_eta", 1.0))
-        eta = torch.full((self.num_head_pairs,), eta_init, device=_non_meta_init_device(self.config), dtype=torch.float32)
+        eta = _attn_ssm_eta(self.config, self.num_head_pairs, _non_meta_init_device(self.config))
         if bool(getattr(self.config, "attn_ssm_learn_eta", False)):
             self.eta = nn.Parameter(eta)
         else:
-            self.register_buffer("eta", eta, persistent=True)
+            self.eta = eta
 
         self.exp_clip = float(getattr(self.config, "attn_ssm_exp_clip", 20.0))
         self.center_positions = bool(getattr(self.config, "attn_ssm_center_positions", True))
@@ -997,6 +1010,30 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
                 "attn_ssm_sink_no_decay_mode must be one of {'exact', 'approx'}, "
                 f"got {self.sink_no_decay_mode!r}"
             )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        # Older checkpoints saved these config-derived tensors as buffers.
+        state_dict.pop(prefix + "tau", None)
+        if not isinstance(getattr(self, "eta", None), nn.Parameter):
+            state_dict.pop(prefix + "eta", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     @property
     def sink_no_decay_exact(self) -> bool:
@@ -1202,6 +1239,49 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
         q_aug, k_aug = self._rebuild_qk_heads(q_, k_, q_avg, q_disp, k_avg, k_disp, q.dtype, k.dtype)
 
         return q_aug, k_aug, sink_logits
+
+
+# class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
+#     """
+#     AttnSSM head-pair modulation using XPos-style reciprocal Q/K scales.
+
+#     Unlike ``AttnSSMRotaryEmbedding``, the distance decay is not parameterized by
+#     ``tau`` and does not compute ``exp(pos / tau)``. Instead, each feature pair
+#     uses the XPos scale schedule from ``xpos_relative_position.py``:
+
+#         scale_d = (d + 0.4 * head_dim) / (1.4 * head_dim)
+
+#     Query features are multiplied by ``scale_d ** (pos / scale_base)`` and key
+#     features by its reciprocal, so a query/key dot product receives the relative
+#     factor ``scale_d ** ((pos_q - pos_k) / scale_base)``.
+#     """
+
+#     def __init__(self, config: ModelConfig, *args, **kwargs):
+#         super().__init__(config, *args, **kwargs)
+#         self.suffix = "attn_ssm_xpos"
+
+#         self.xpos_scale_base = float(getattr(self.config, "attn_ssm_xpos_scale_base", 512.0))
+#         if self.xpos_scale_base <= 0.0:
+#             raise ValueError("attn_ssm_xpos_scale_base must be positive")
+
+#         scale = (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=_non_meta_init_device(self.config))
+#                  + 0.4 * self.head_dim) / (1.4 * self.head_dim)
+#         scale = scale.repeat_interleave(2)[: self.head_dim]
+#         self.xpos_scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
+
+#     def _position_factors(self, pos: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+#         device = pos.device
+#         scale = self.xpos_scale.to(device=device, dtype=torch.float32).view(1, 1, 1, self.head_dim)
+#         exponent = pos.to(device=device, dtype=torch.float32).view(1, -1, 1, 1) / self.xpos_scale_base
+#         q_scale = torch.pow(scale, exponent)
+#         k_scale = q_scale.reciprocal()
+
+#         a = q_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
+#         c = k_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
+#         if self.sink_no_decay_approx and pos.numel() > 0:
+#             c = c.clone()
+#             c[:, 0, :, :] = q_scale[:, -1, :, :].reciprocal().to(dtype=dtype)
+#         return a, c
 
 
 class FourierEmbedding(RotaryEmbedding):
@@ -1571,6 +1651,10 @@ class OLMoBlock(nn.Module):
                 if self.config.effective_n_kv_heads != self.config.n_heads:
                     raise ValueError("rope_variant='attn_ssm' currently requires n_kv_heads == n_heads")
                 self.pos_emb = AttnSSMRotaryEmbedding(config, self.__cache)
+            elif rope_variant in {"attn_ssm_xpos", "attn-ssm-xpos", "attnssm_xpos", "attnssmxpos"}:
+                if self.config.effective_n_kv_heads != self.config.n_heads:
+                    raise ValueError("rope_variant='attn_ssm_xpos' currently requires n_kv_heads == n_heads")
+                self.pos_emb = AttnSSMXPosRotaryEmbedding(config, self.__cache)
             else:
                 self.pos_emb = RotaryEmbedding(config, self.__cache)
         
