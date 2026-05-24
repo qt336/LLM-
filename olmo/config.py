@@ -547,6 +547,13 @@ class ModelConfig(BaseConfig):
     """
     Scale base used by the XPos-style AttnSSM positional modulation.
     """
+
+    attn_ssm_xpos_exp_clip: float = 80.0
+    """
+    Clip range for XPos log Q/K scales before exponentiation in attn_ssm_xpos.
+    The default is chosen for fp32 scale computation, below the fp32 exp overflow
+    threshold with margin.
+    """
     
     fourier: bool = False
     """

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 """Simulate last-query attention using the position embedding modules in olmo.model.
 
-This script compares three implementations from ``olmo/model.py``:
+This script compares four implementations from ``olmo/model.py``:
 
 * ``RotaryEmbedding`` for RoPE
 * ``FourierEmbedding`` for Fourier RoPE
 * ``AttnSSMRotaryEmbedding`` for EyePE / attn_ssm
+* ``AttnSSMXPosRotaryEmbedding`` for EyePE-XPos / attn_ssm_xpos
 
 Two input modes are plotted separately:
 
@@ -35,7 +36,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from olmo.config import ModelConfig
-from olmo.model import AttnSSMRotaryEmbedding, BufferCache, FourierEmbedding, RotaryEmbedding
+from olmo.model import (
+    AttnSSMRotaryEmbedding,
+    AttnSSMXPosRotaryEmbedding,
+    BufferCache,
+    FourierEmbedding,
+    RotaryEmbedding,
+)
 
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/c4/length-1024/ce-extra/plain/OLMo-60M-ce-attn-ssm-yarn.yaml"
@@ -45,18 +52,20 @@ EMBEDDING_LABELS = {
     "rope": "RoPE",
     "fourier_rope": "Fourier RoPE",
     "eyepe": "EyePE",
+    "eyepe_xpos": "EyePE-XPos",
 }
 COLORS = {
     "rope": "#2563eb",
     "fourier_rope": "#d97706",
     "eyepe": "#059669",
+    "eyepe_xpos": "#7c3aed",
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare last-query attention curves for RoPE, Fourier RoPE, and EyePE "
+            "Compare last-query attention curves for RoPE, Fourier RoPE, EyePE, and EyePE-XPos "
             "by directly using the position embedding modules in olmo/model.py."
         )
     )
@@ -139,6 +148,8 @@ def build_config(base: ModelConfig, *, seq_len: int, head_dim: int, n_heads: int
         kwargs.update(fourier=True, rope_variant="rope")
     elif kind == "eyepe":
         kwargs.update(fourier=False, rope_variant="attn_ssm")
+    elif kind == "eyepe_xpos":
+        kwargs.update(fourier=False, rope_variant="attn_ssm_xpos")
     else:
         raise ValueError(f"Unknown config kind: {kind}")
 
@@ -163,10 +174,16 @@ def build_embeddings(base: ModelConfig, *, seq_len: int, head_dim: int, n_heads:
         BufferCache(),
     )
 
+    eyepe_xpos = AttnSSMXPosRotaryEmbedding(
+        build_config(base, seq_len=seq_len, head_dim=head_dim, n_heads=n_heads, kind="eyepe_xpos"),
+        BufferCache(),
+    )
+
     return {
         "rope": rope.eval(),
         "fourier_rope": fourier.eval(),
         "eyepe": eyepe.eval(),
+        "eyepe_xpos": eyepe_xpos.eval(),
     }
 
 
@@ -287,7 +304,7 @@ def plot_mode(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(10.5, 6.2), constrained_layout=True)
-    for key in ("rope", "fourier_rope", "eyepe"):
+    for key in ("rope", "fourier_rope", "eyepe", "eyepe_xpos"):
         ax.plot(
             distances.numpy(),
             curves[key].numpy(),
@@ -313,7 +330,7 @@ def save_csv(curves: Mapping[str, torch.Tensor], output_path: Path) -> None:
     seq_len = next(iter(curves.values())).numel()
     with output_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["distance", "rope", "fourier_rope", "eyepe"])
+        writer.writerow(["distance", "rope", "fourier_rope", "eyepe", "eyepe_xpos"])
         for distance in range(seq_len):
             writer.writerow(
                 [
@@ -321,6 +338,7 @@ def save_csv(curves: Mapping[str, torch.Tensor], output_path: Path) -> None:
                     float(curves["rope"][distance]),
                     float(curves["fourier_rope"][distance]),
                     float(curves["eyepe"][distance]),
+                    float(curves["eyepe_xpos"][distance]),
                 ]
             )
 

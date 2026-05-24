@@ -1241,47 +1241,83 @@ class AttnSSMRotaryEmbedding(RotaryEmbedding):
         return q_aug, k_aug, sink_logits
 
 
-# class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
-#     """
-#     AttnSSM head-pair modulation using XPos-style reciprocal Q/K scales.
+class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
+    """
+    AttnSSM head-pair modulation using XPos-style reciprocal Q/K scales.
 
-#     Unlike ``AttnSSMRotaryEmbedding``, the distance decay is not parameterized by
-#     ``tau`` and does not compute ``exp(pos / tau)``. Instead, each feature pair
-#     uses the XPos scale schedule from ``xpos_relative_position.py``:
+    Unlike ``AttnSSMRotaryEmbedding``, the distance decay is not parameterized by
+    ``tau`` and does not compute ``exp(pos / tau)``. Instead, each feature pair
+    uses the XPos scale schedule from ``xpos_relative_position.py``:
 
-#         scale_d = (d + 0.4 * head_dim) / (1.4 * head_dim)
+        scale_d = (d + 0.4 * head_dim) / (1.4 * head_dim)
 
-#     Query features are multiplied by ``scale_d ** (pos / scale_base)`` and key
-#     features by its reciprocal, so a query/key dot product receives the relative
-#     factor ``scale_d ** ((pos_q - pos_k) / scale_base)``.
-#     """
+    Query features are multiplied by ``scale_d ** (pos / scale_base)`` and key
+    features by its reciprocal, so a query/key dot product receives the relative
+    factor ``scale_d ** ((pos_q - pos_k) / scale_base)``.
+    """
 
-#     def __init__(self, config: ModelConfig, *args, **kwargs):
-#         super().__init__(config, *args, **kwargs)
-#         self.suffix = "attn_ssm_xpos"
+    def __init__(self, config: ModelConfig, *args, **kwargs):
+        kwargs["use_rope_cache"] = False
+        RotaryEmbedding.__init__(self, config, *args, **kwargs)
+        self.suffix = "attn_ssm_xpos"
 
-#         self.xpos_scale_base = float(getattr(self.config, "attn_ssm_xpos_scale_base", 512.0))
-#         if self.xpos_scale_base <= 0.0:
-#             raise ValueError("attn_ssm_xpos_scale_base must be positive")
+        if self.prefix != "attn":
+            raise ValueError("AttnSSMXPosRotaryEmbedding only supports prefix='attn'")
 
-#         scale = (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=_non_meta_init_device(self.config))
-#                  + 0.4 * self.head_dim) / (1.4 * self.head_dim)
-#         scale = scale.repeat_interleave(2)[: self.head_dim]
-#         self.xpos_scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
+        self.head_dim = self.dim
+        self.num_head_pairs = self.config.n_heads // 2
+        self.has_odd_head = (self.config.n_heads % 2) == 1
 
-#     def _position_factors(self, pos: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-#         device = pos.device
-#         scale = self.xpos_scale.to(device=device, dtype=torch.float32).view(1, 1, 1, self.head_dim)
-#         exponent = pos.to(device=device, dtype=torch.float32).view(1, -1, 1, 1) / self.xpos_scale_base
-#         q_scale = torch.pow(scale, exponent)
-#         k_scale = q_scale.reciprocal()
+        if self.num_head_pairs < 1:
+            raise ValueError("rope_variant='attn_ssm_xpos' requires at least 2 attention heads")
 
-#         a = q_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
-#         c = k_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
-#         if self.sink_no_decay_approx and pos.numel() > 0:
-#             c = c.clone()
-#             c[:, 0, :, :] = q_scale[:, -1, :, :].reciprocal().to(dtype=dtype)
-#         return a, c
+        eta = _attn_ssm_eta(self.config, self.num_head_pairs, _non_meta_init_device(self.config))
+        if bool(getattr(self.config, "attn_ssm_learn_eta", False)):
+            self.eta = nn.Parameter(eta)
+        else:
+            self.eta = eta
+
+        self.center_positions = bool(getattr(self.config, "attn_ssm_center_positions", True))
+        self.sink_no_decay = bool(
+            getattr(self.config, "attn_ssm_sink_no_decay", False)
+            or getattr(self.config, "attn_ssm_sink_anchor_positions", False)
+        )
+        self.sink_no_decay_mode = str(getattr(self.config, "attn_ssm_sink_no_decay_mode", "exact")).lower()
+        if self.sink_no_decay_mode not in {"exact", "approx"}:
+            raise ValueError(
+                "attn_ssm_sink_no_decay_mode must be one of {'exact', 'approx'}, "
+                f"got {self.sink_no_decay_mode!r}"
+            )
+
+        self.xpos_scale_base = float(getattr(self.config, "attn_ssm_xpos_scale_base", 512.0))
+        if self.xpos_scale_base <= 0.0:
+            raise ValueError("attn_ssm_xpos_scale_base must be positive")
+        self.xpos_exp_clip = float(getattr(self.config, "attn_ssm_xpos_exp_clip", 80.0))
+
+        scale = (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=_non_meta_init_device(self.config))
+            + 0.4 * self.head_dim
+        ) / (1.4 * self.head_dim)
+        scale = scale.repeat_interleave(2)[: self.head_dim]
+        self.xpos_scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
+
+    def _position_factors(self, pos: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        del dtype
+        device = pos.device
+        scale = self.xpos_scale.to(device=device, dtype=torch.float32).view(1, 1, 1, self.head_dim)
+        exponent = pos.to(device=device, dtype=torch.float32).view(1, -1, 1, 1) / self.xpos_scale_base
+        log_q_scale = exponent * torch.log(scale)
+        if self.xpos_exp_clip > 0:
+            log_q_scale = log_q_scale.clamp(-self.xpos_exp_clip, self.xpos_exp_clip)
+        q_scale = torch.exp(log_q_scale)
+        k_scale = torch.exp(-log_q_scale)
+
+        a = q_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim)
+        c = k_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim)
+        if self.sink_no_decay_approx and pos.numel() > 0:
+            c = c.clone()
+            c[:, 0, :, :] = torch.exp(-log_q_scale[:, -1, :, :])
+        return a, c
 
 
 class FourierEmbedding(RotaryEmbedding):

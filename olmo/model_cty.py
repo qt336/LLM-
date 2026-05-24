@@ -1187,6 +1187,7 @@ class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
         self.xpos_scale_base = float(getattr(self.config, "attn_ssm_xpos_scale_base", 512.0))
         if self.xpos_scale_base <= 0.0:
             raise ValueError("attn_ssm_xpos_scale_base must be positive")
+        self.xpos_exp_clip = float(getattr(self.config, "attn_ssm_xpos_exp_clip", 80.0))
 
         scale = (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=_non_meta_init_device(self.config))
                  + 0.4 * self.head_dim) / (1.4 * self.head_dim)
@@ -1194,14 +1195,18 @@ class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
         self.xpos_scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
 
     def _position_factors(self, pos: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        del dtype
         device = pos.device
         scale = self.xpos_scale.to(device=device, dtype=torch.float32).view(1, 1, 1, self.head_dim)
         exponent = pos.to(device=device, dtype=torch.float32).view(1, -1, 1, 1) / self.xpos_scale_base
-        q_scale = torch.pow(scale, exponent)
-        k_scale = q_scale.reciprocal()
+        log_q_scale = exponent * torch.log(scale)
+        if self.xpos_exp_clip > 0:
+            log_q_scale = log_q_scale.clamp(-self.xpos_exp_clip, self.xpos_exp_clip)
+        q_scale = torch.exp(log_q_scale)
+        k_scale = torch.exp(-log_q_scale)
 
-        a = q_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
-        c = k_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim).to(dtype=dtype)
+        a = q_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim)
+        c = k_scale.expand(1, pos.numel(), self.num_head_pairs, self.head_dim)
         return a, c
 
 

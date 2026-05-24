@@ -15,7 +15,7 @@ model:
   weight_tying: false
   alibi: false
   rope: true
-  rope_variant: attn_ssm
+  rope_variant: attn_ssm_xpos
   fourier: false
   flash_attention: true
   attention_dropout: 0.0
@@ -40,13 +40,11 @@ model:
   init_fn: normal
   init_std: 0.001
   init_cutoff_factor: 3
-  attn_ssm_tau_min: 8.0
-  attn_ssm_tau_ratio: 1.323170478
-  attn_ssm_pair_tau_ratio: 0.975
-  attn_ssm_tau_max: null
+  attn_ssm_xpos_scale_base: 320
+  attn_ssm_xpos_exp_clip: 80.0
   attn_ssm_disparity_eta: 1.0
   attn_ssm_learn_eta: false
-  attn_ssm_exp_clip: 20.0
+  # attn_ssm_exp_clip: 20.0
   attn_ssm_center_positions: false
   attn_ssm_sink_no_decay: false
 
