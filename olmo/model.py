@@ -1296,8 +1296,8 @@ class AttnSSMXPosRotaryEmbedding(AttnSSMRotaryEmbedding):
 
         scale = (
             torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=_non_meta_init_device(self.config))
-            + 0.4 * self.head_dim
-        ) / (1.4 * self.head_dim)
+            +  self.head_dim
+        ) / (2 * self.head_dim)
         scale = scale.repeat_interleave(2)[: self.head_dim]
         self.xpos_scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
 

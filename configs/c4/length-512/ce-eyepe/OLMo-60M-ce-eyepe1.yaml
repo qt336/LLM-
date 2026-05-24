@@ -38,9 +38,9 @@ model:
   pad_token_id: 1
   init_device: cuda
   init_fn: normal
-  init_std: 0.001
+  init_std: 0.02
   init_cutoff_factor: 3
-  attn_ssm_xpos_scale_base: 320
+  attn_ssm_xpos_scale_base: 80
   attn_ssm_xpos_exp_clip: 80.0
   attn_ssm_disparity_eta: 1.0
   attn_ssm_learn_eta: false
@@ -255,6 +255,19 @@ evaluators:
   - label: arc_easy_ppl
     type: downstream
 
+  - label: passkey
+    type: generation
+    device_eval_batch_size: 16
+    generation:
+      passkey:
+        min_tokens: 128
+        max_tokens: 8192
+        length_step: 128
+        iterations: 20
+        same_examples: true
+        max_new_tokens: 10
+        seed: 6198
+        
 data:
   pad_direction: right
   num_workers: 32

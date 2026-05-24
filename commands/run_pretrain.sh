@@ -33,10 +33,9 @@ pip install .
 
 swanlab login -k JiajEBS83WEnPgZvcX4Bv
 
-torchrun --nproc_per_node=8 scripts/train.py   configs/c4/length-512/ce-eyepe/OLMo-60M-ce-eyepe1.yaml   --run_name=OLMo-60M-ce-512-eyepe3  --save_folder=workspace/OLMo-60M-ce-512-eyepe3 --swanlab --swanlab.entity=MiracleLpX --swanlab.project=RoPE --swanlab.name=OLMo-60M-ce-512-eyepe3
+torchrun --nproc_per_node=8 scripts/train.py   configs/c4/length-512/ce-eyepe/OLMo-60M-ce-eyepe1.yaml   --run_name=OLMo-60M-ce-512-eyepe-test5  --save_folder=workspace/OLMo-60M-ce-512-eyepe-test5 --swanlab --swanlab.entity=MiracleLpX --swanlab.project=RoPE --swanlab.name=OLMo-60M-ce-512-eyepe-test5
 
-torchrun --nproc_per_node=8 scripts/train.py   configs/c4/length-512/ce-eyepe/OLMo-60M-ce-eyepe1.yaml   --run_name=OLMo-60M-ce-512-eyepe-1  --save_folder=workspace/OLMo-60M-ce-512-eyepe-1--swanlab --swanlab.entity=MiracleLpX --swanlab.project=RoPE --swanlab.name=OLMo-60M-ce-512-eyepe-1
-
+torchrun --nproc_per_node=8 scripts/train.py   configs/c4/length-512/ce-eyepe/OLMo-60M-ce-eyepe1.yaml   --run_name=OLMo-60M-ce-512-eyepe4  --save_folder=workspace/OLMo-60M-ce-512-eyepe4 --swanlab --swanlab.entity=MiracleLpX --swanlab.project=RoPE --swanlab.name=OLMo-60M-ce-512-eyepe4
 
 torchrun --nproc_per_node=8 scripts/train.py   configs/c4/length-512/ce-rope/OLMo-60M-ce.yaml   --run_name=OLMo-60M-ce-512-rope-c4   --save_folder=workspace/OLMo-60M-ce-512-rope-c4 --swanlab --swanlab.entity=MiracleLpX --swanlab.project=RoPE --swanlab.name=OLMo-60M-ce-512-rope-c4 
 
