@@ -727,7 +727,28 @@ class Trainer:
             labels.masked_fill_(attention_mask == 0.0, -100)
         if instance_mask is not None:
             labels.masked_fill_(~instance_mask.unsqueeze(-1), value=-100)
-        return labels[..., 1:].contiguous()
+        labels = labels[..., 1:].contiguous()
+        if self.cfg.loss_last_token_only:
+            labels[..., :-1] = -100
+        return labels
+
+    def get_last_token_label(self, batch: Dict[str, Any]) -> torch.Tensor:
+        labels = batch["input_ids"][..., -1].clone()
+        label_mask = batch.get("label_mask")
+        attention_mask = batch.get("attention_mask")
+        instance_mask = batch.get("instance_mask")
+        if label_mask is not None:
+            labels.masked_fill_(~label_mask[..., -1], -100)
+        if attention_mask is not None:
+            labels.masked_fill_(attention_mask[..., -1] == 0.0, -100)
+        if instance_mask is not None:
+            labels.masked_fill_(~instance_mask, value=-100)
+        return labels
+
+    def _slice_attention_bias_prefix(self, attention_bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if attention_bias is None:
+            return None
+        return attention_bias[..., :-1, :-1].contiguous()
 
     def model_forward(
         self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, use_rope_cache: bool = False
@@ -756,22 +777,44 @@ class Trainer:
         #         max_doc_lens=batch.get("max_doc_lens"),
         #     ).logits
         # else:
-        # shape: (batch_size, seq_len, vocab_size)
-        logits = self.dist_model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask"),
-            attention_bias=batch.get("attention_bias"),
-            doc_lens=batch.get("doc_lens"), 
-            max_doc_lens=batch.get("max_doc_lens"),
-            use_rope_cache=use_rope_cache,
-        ).logits
-        logits_for_loss = logits[..., :-1, :].contiguous()
-        # shape: (batch_size * seq_len, vocab_size)
-        logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
-        # shape: (batch_size, seq_len)
-        labels = self.get_labels(batch)
-        # shape: (batch_size * seq_len,)
-        labels = labels.view(-1)
+        use_fast_last_token_only = (
+            self.cfg.loss_last_token_only
+            and batch["input_ids"].shape[-1] >= 2
+            and batch.get("doc_lens") is None
+            and batch.get("max_doc_lens") is None
+            and loss_reduction == "sum"
+        )
+        if use_fast_last_token_only:
+            logits = self.dist_model(
+                input_ids=batch["input_ids"][..., :-1].contiguous(),
+                attention_mask=(
+                    batch.get("attention_mask")[..., :-1].contiguous()
+                    if batch.get("attention_mask") is not None
+                    else None
+                ),
+                attention_bias=self._slice_attention_bias_prefix(batch.get("attention_bias")),
+                use_rope_cache=use_rope_cache,
+                last_logits_only=True,
+            ).logits
+            logits_for_loss = logits[:, -1, :].contiguous()
+            labels = self.get_last_token_label(batch)
+        else:
+            # shape: (batch_size, seq_len, vocab_size)
+            logits = self.dist_model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch.get("attention_mask"),
+                attention_bias=batch.get("attention_bias"),
+                doc_lens=batch.get("doc_lens"), 
+                max_doc_lens=batch.get("max_doc_lens"),
+                use_rope_cache=use_rope_cache,
+            ).logits
+            logits_for_loss = logits[..., :-1, :].contiguous()
+            # shape: (batch_size * seq_len, vocab_size)
+            logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
+            # shape: (batch_size, seq_len)
+            labels = self.get_labels(batch)
+            # shape: (batch_size * seq_len,)
+            labels = labels.view(-1)
         ce_loss, z_loss = self.loss_fn(
             logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
         )

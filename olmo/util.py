@@ -16,12 +16,8 @@ from queue import Queue
 from threading import Thread
 from typing import Any, Callable, Dict, MutableMapping, Optional, Tuple, Union
 
-import boto3
-import botocore.exceptions as boto_exceptions
 import datasets
 import rich
-from botocore.config import Config
-from cached_path.schemes import SchemeClient, add_scheme_client
 from rich.console import Console, ConsoleRenderable
 from rich.highlighter import NullHighlighter
 from rich.progress import Progress
@@ -29,6 +25,36 @@ from rich.text import Text
 from rich.traceback import Traceback
 
 from olmo_data.data import get_data_path
+
+try:
+    import boto3
+    import botocore.exceptions as boto_exceptions
+    from botocore.config import Config
+except ImportError:
+    boto3 = None
+    Config = None
+
+    class _MissingBotoError(Exception):
+        pass
+
+    class _MissingBotoExceptions:
+        ClientError = _MissingBotoError
+        HTTPClientError = _MissingBotoError
+        ConnectionError = _MissingBotoError
+
+    boto_exceptions = _MissingBotoExceptions()  # type: ignore[assignment]
+
+try:
+    from cached_path.schemes import SchemeClient, add_scheme_client
+except ImportError:
+    class SchemeClient:  # type: ignore[no-redef]
+        recoverable_errors: Tuple[type[BaseException], ...] = ()
+
+        def __init__(self, resource: str) -> None:
+            self.resource = resource
+
+    def add_scheme_client(_client) -> None:
+        return None
 
 from .aliases import PathOrStr
 from .exceptions import (
@@ -319,10 +345,16 @@ def resource_path(
     if local_cache is not None and (local_path := Path(local_cache) / fname).is_file():
         log.info(f"Found local cache of {fname} at {local_path}")
         return local_path
-    else:
-        from cached_path import cached_path
 
-        return cached_path(f"{str(folder).rstrip('/')}/{fname}", progress=progress)
+    if not is_url(folder):
+        local_path = Path(folder) / fname
+        if local_path.exists():
+            return local_path
+        raise FileNotFoundError(local_path)
+
+    from cached_path import cached_path
+
+    return cached_path(f"{str(folder).rstrip('/')}/{fname}", progress=progress)
 
 
 def file_size(path: PathOrStr) -> int:
@@ -505,6 +537,8 @@ def _get_s3_endpoint_url(scheme: str) -> Optional[str]:
 
 @cache
 def _get_s3_client(scheme: str):
+    if boto3 is None or Config is None:
+        raise ModuleNotFoundError("boto3 is required for S3, R2, and Weka storage access")
     session = boto3.Session(profile_name=_get_s3_profile_name(scheme))
     return session.client(
         "s3",
@@ -780,6 +814,8 @@ def roundrobin(*iterables):
 
 
 def add_cached_path_clients():
+    if boto3 is None:
+        return
     add_scheme_client(WekaClient)
 
 

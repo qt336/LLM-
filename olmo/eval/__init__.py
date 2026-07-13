@@ -6,6 +6,7 @@ from torchmetrics import MeanMetric, Metric
 
 from ..config import EvaluatorConfig, EvaluatorType, TrainConfig
 from ..exceptions import OLMoConfigurationError
+from ..perplexity import get_remapped_period_token_range
 from ..tokenizer import Tokenizer
 from ..torch_util import get_global_rank, get_world_size
 from .downstream import ICLMetric, label_to_task_map
@@ -121,10 +122,15 @@ def build_evaluator(
             return MeanMetric(nan_strategy="error").to(device)
 
         eval_metric: Union[Metric, Dict[str, Metric]]
+        adjusted_eval_metric: Optional[Union[Metric, Dict[str, Metric]]] = None
         if eval_config.data.paths:
             eval_metric = make_metric()
+            if train_config.perplexity.ignore_period_surprisal:
+                adjusted_eval_metric = make_metric()
         elif eval_config.data.datasets:
             eval_metric = {label: make_metric() for label in eval_config.data.datasets.keys()}
+            if train_config.perplexity.ignore_period_surprisal:
+                adjusted_eval_metric = {label: make_metric() for label in eval_config.data.datasets.keys()}
         else:
             raise OLMoConfigurationError("One of DataConfig.paths or DataConfig.datasets is required")
 
@@ -133,7 +139,9 @@ def build_evaluator(
             type=eval_config.type,
             eval_loader=eval_loader,
             eval_metric=eval_metric,
+            adjusted_eval_metric=adjusted_eval_metric,
             subset_num_batches=eval_config.subset_num_batches,
+            period_token_range=get_remapped_period_token_range(eval_config.data.token_id_remap),
         )
     else:
         raise ValueError(f"Unexpected evaluator type '{eval_config.type}'")
@@ -141,7 +149,9 @@ def build_evaluator(
 
 def build_evaluators(cfg: TrainConfig, device: torch.device) -> List[Evaluator]:
     evaluators = []
-    tokenizer = Tokenizer.from_train_config(cfg)
+    tokenizer: Tokenizer | None = None
     for eval_cfg in cfg.evaluators:
-        evaluators.append(build_evaluator(cfg, eval_cfg, tokenizer, device))
+        if eval_cfg.type != EvaluatorType.lm and tokenizer is None:
+            tokenizer = Tokenizer.from_train_config(cfg)
+        evaluators.append(build_evaluator(cfg, eval_cfg, tokenizer, device))  # type: ignore[arg-type]
     return evaluators

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
 from pstats import SortKey
-from typing import Any, Callable, Deque, Dict, List, Optional, TextIO, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, TextIO, Tuple, Union
 
 import numpy as np
 import torch
@@ -23,13 +23,18 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils
 import torch.utils.hooks
-import swanlab
 from packaging import version
+
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from .aliases import PathOrStr
+from .attention_probe import AttentionProbeTracker
 from .checkpoint import Checkpointer, FullCheckpointer, build_sharded_checkpointer
 from .config import (
     CheckpointType,
@@ -41,11 +46,10 @@ from .config import (
     TrainConfig,
 )
 from .data import IterableDataset
-from .eval import Evaluator
-from .eval.passkey import PasskeyMetric
 from .exceptions import OLMoConfigurationError
 from .model import OLMo
 from .optim import Optimizer, Scheduler
+from .perplexity import get_remapped_period_token_range, zero_period_losses
 from .tokenizer import Tokenizer
 from .torch_util import (
     barrier,
@@ -63,6 +67,9 @@ from .util import upload
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
 
 log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .eval.evaluator import Evaluator
 
 
 @dataclass
@@ -235,6 +242,13 @@ class Trainer:
     last_sharded_checkpoint_step: Optional[int] = None
     last_unsharded_checkpoint_step: Optional[int] = None
     swanlab_run: Optional[Any] = None
+    latest_eval_perplexity: Dict[str, float] = field(default_factory=dict)
+    train_perplexity_history: List[Tuple[float, float]] = field(default_factory=list)
+    eval_perplexity_history: List[Tuple[float, float]] = field(default_factory=list)
+    _train_period_token_range: Optional[Tuple[int, int]] = None
+    _train_ppl_path: Optional[Path] = None
+    _eval_ppl_path: Optional[Path] = None
+    _attention_probe: Optional[AttentionProbeTracker] = None
     
     def __post_init__(self):
         if self.cfg.fused_loss:
@@ -242,6 +256,17 @@ class Trainer:
                 self.loss_fn = fused_loss_fn
             else:
                 raise NameError("`fused_loss_fn` is not defined. Please ensure that `flash_attn` is installed.")
+
+        self._train_period_token_range = get_remapped_period_token_range(self.cfg.data.token_id_remap)
+        save_folder = Path(self.cfg.save_folder)
+        self._train_ppl_path = save_folder / "train_perplexity_improved.npy"
+        self._eval_ppl_path = save_folder / "eval_perplexity_improved.npy"
+        if (
+            self.cfg.attention_probe is not None
+            and self.cfg.attention_probe.enabled
+            and get_global_rank() == 0
+        ):
+            self._attention_probe = AttentionProbeTracker(self.cfg, self.model, self.device)
         
         # TODO: add support for Intuitive Loss
         # if self.cfg.intuitive_loss:
@@ -727,7 +752,43 @@ class Trainer:
             labels.masked_fill_(attention_mask == 0.0, -100)
         if instance_mask is not None:
             labels.masked_fill_(~instance_mask.unsqueeze(-1), value=-100)
-        return labels[..., 1:].contiguous()
+        labels = labels[..., 1:].contiguous()
+        if self.cfg.loss_last_token_only:
+            labels[..., :-1] = -100
+        return labels
+
+    def get_last_token_label(self, batch: Dict[str, Any]) -> torch.Tensor:
+        labels = batch["input_ids"][..., -1].clone()
+        label_mask = batch.get("label_mask")
+        attention_mask = batch.get("attention_mask")
+        instance_mask = batch.get("instance_mask")
+        if label_mask is not None:
+            labels.masked_fill_(~label_mask[..., -1], -100)
+        if attention_mask is not None:
+            labels.masked_fill_(attention_mask[..., -1] == 0.0, -100)
+        if instance_mask is not None:
+            labels.masked_fill_(~instance_mask, value=-100)
+        return labels
+
+    def _slice_attention_bias_prefix(self, attention_bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if attention_bias is None:
+            return None
+        return attention_bias[..., :-1, :-1].contiguous()
+
+    def adjusted_perplexity_loss(self, ce_loss: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if not self.cfg.perplexity.ignore_period_surprisal:
+            return ce_loss
+        return zero_period_losses(ce_loss, labels, self._train_period_token_range)
+
+    def persist_perplexity_history(self) -> None:
+        if get_global_rank() != 0:
+            return
+        if self._train_ppl_path is not None:
+            self._train_ppl_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(self._train_ppl_path, np.asarray(self.train_perplexity_history, dtype=np.float64))
+        if self._eval_ppl_path is not None:
+            self._eval_ppl_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(self._eval_ppl_path, np.asarray(self.eval_perplexity_history, dtype=np.float64))
 
     def model_forward(
         self, batch: Dict[str, Any], loss_reduction: str = "mean", compute_z_loss: bool = False, use_rope_cache: bool = False
@@ -756,22 +817,44 @@ class Trainer:
         #         max_doc_lens=batch.get("max_doc_lens"),
         #     ).logits
         # else:
-        # shape: (batch_size, seq_len, vocab_size)
-        logits = self.dist_model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch.get("attention_mask"),
-            attention_bias=batch.get("attention_bias"),
-            doc_lens=batch.get("doc_lens"), 
-            max_doc_lens=batch.get("max_doc_lens"),
-            use_rope_cache=use_rope_cache,
-        ).logits
-        logits_for_loss = logits[..., :-1, :].contiguous()
-        # shape: (batch_size * seq_len, vocab_size)
-        logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
-        # shape: (batch_size, seq_len)
-        labels = self.get_labels(batch)
-        # shape: (batch_size * seq_len,)
-        labels = labels.view(-1)
+        use_fast_last_token_only = (
+            self.cfg.loss_last_token_only
+            and batch["input_ids"].shape[-1] >= 2
+            and batch.get("doc_lens") is None
+            and batch.get("max_doc_lens") is None
+            and loss_reduction == "sum"
+        )
+        if use_fast_last_token_only:
+            logits = self.dist_model(
+                input_ids=batch["input_ids"][..., :-1].contiguous(),
+                attention_mask=(
+                    batch.get("attention_mask")[..., :-1].contiguous()
+                    if batch.get("attention_mask") is not None
+                    else None
+                ),
+                attention_bias=self._slice_attention_bias_prefix(batch.get("attention_bias")),
+                use_rope_cache=use_rope_cache,
+                last_logits_only=True,
+            ).logits
+            logits_for_loss = logits[:, -1, :].contiguous()
+            labels = self.get_last_token_label(batch)
+        else:
+            # shape: (batch_size, seq_len, vocab_size)
+            logits = self.dist_model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch.get("attention_mask"),
+                attention_bias=batch.get("attention_bias"),
+                doc_lens=batch.get("doc_lens"), 
+                max_doc_lens=batch.get("max_doc_lens"),
+                use_rope_cache=use_rope_cache,
+            ).logits
+            logits_for_loss = logits[..., :-1, :].contiguous()
+            # shape: (batch_size * seq_len, vocab_size)
+            logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
+            # shape: (batch_size, seq_len)
+            labels = self.get_labels(batch)
+            # shape: (batch_size * seq_len,)
+            labels = labels.view(-1)
         ce_loss, z_loss = self.loss_fn(
             logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
         )
@@ -805,7 +888,9 @@ class Trainer:
 
         return loss, ce_loss, z_loss
 
-    def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def train_batch(
+        self, batch: Dict[str, Any], collect_adjusted_perplexity: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Split into micro-batches.
         micro_batches = self.split_batch(batch)
         batch_size_in_tokens = batch["input_ids"].numel()
@@ -815,6 +900,7 @@ class Trainer:
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
+        adjusted_loss_sum = None if not collect_adjusted_perplexity else torch.tensor(0.0, device=self.device)
         num_micro_batches = len(micro_batches)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
@@ -840,6 +926,30 @@ class Trainer:
                     # Update overall CE batch loss.
                     ce_batch_loss += ce_loss.detach()
 
+                    if collect_adjusted_perplexity:
+                        labels = self.get_labels(micro_batch)
+                        with torch.no_grad():
+                            logits = self.dist_model(
+                                input_ids=micro_batch["input_ids"],
+                                attention_mask=micro_batch.get("attention_mask"),
+                                attention_bias=micro_batch.get("attention_bias"),
+                                doc_lens=micro_batch.get("doc_lens"),
+                                max_doc_lens=micro_batch.get("max_doc_lens"),
+                                use_rope_cache=False,
+                            ).logits
+                            logits_for_loss = logits[..., :-1, :].contiguous().view(-1, logits.size(-1))
+                            flat_labels = labels.view(-1)
+                            token_ce_loss = F.cross_entropy(
+                                logits_for_loss,
+                                flat_labels,
+                                ignore_index=-100,
+                                reduction="none",
+                            ).view(labels.shape)
+                            adjusted_token_ce_loss = self.adjusted_perplexity_loss(token_ce_loss, labels)
+                            adjusted_loss_sum += (
+                                adjusted_token_ce_loss[labels != -100].sum().detach() / batch_size_in_tokens
+                            )
+
                     # Update overall Z batch loss.
                     if z_loss is not None:
                         assert z_batch_loss is not None
@@ -852,7 +962,7 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        return ce_batch_loss, z_batch_loss
+        return ce_batch_loss, z_batch_loss, adjusted_loss_sum
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -873,7 +983,10 @@ class Trainer:
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss = self.train_batch(batch)
+        collect_adjusted_perplexity = self.cfg.perplexity.ignore_period_surprisal and reduce_global_loss
+        ce_batch_loss, z_batch_loss, adjusted_loss_sum = self.train_batch(
+            batch, collect_adjusted_perplexity=collect_adjusted_perplexity
+        )
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -882,6 +995,9 @@ class Trainer:
             if z_batch_loss is not None:
                 dist.reduce(z_batch_loss, 0)
                 z_batch_loss.div_(get_world_size())
+            if adjusted_loss_sum is not None:
+                dist.reduce(adjusted_loss_sum, 0)
+                adjusted_loss_sum.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
@@ -922,7 +1038,20 @@ class Trainer:
         self.cur_train_loss = ce_batch_loss.item()
         self.min_train_loss = min(self.min_train_loss, self.cur_train_loss)
         metrics["train/CrossEntropyLoss"] = self.cur_train_loss
-        metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
+        metrics["train/PerplexityRaw"] = math.exp(self.cur_train_loss)
+
+        if adjusted_loss_sum is not None:
+            train_perplexity = math.exp(adjusted_loss_sum.item())
+        else:
+            train_perplexity = math.exp(self.cur_train_loss)
+        metrics["train/Perplexity"] = train_perplexity
+        self.train_perplexity_history.append((float(self.global_step), train_perplexity))
+
+        if self.latest_eval_perplexity:
+            for label, value in self.latest_eval_perplexity.items():
+                metrics[f"train/LatestEvalPerplexity/{label}"] = value
+
+        self.persist_perplexity_history()
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
 
@@ -936,10 +1065,16 @@ class Trainer:
 
         return metrics
 
-    def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
             ce_loss, _, logits = self.model_forward(batch, loss_reduction="none", use_rope_cache=False)
-        return ce_loss.mean(dim=-1), logits
+        labels = self.get_labels(batch)
+        adjusted_ce_loss = self.adjusted_perplexity_loss(ce_loss, labels)
+        valid_mask = labels != -100
+        token_counts = valid_mask.sum(dim=-1).clamp_min(1)
+        raw_loss = (ce_loss * valid_mask).sum(dim=-1) / token_counts
+        adjusted_loss = (adjusted_ce_loss * valid_mask).sum(dim=-1) / token_counts
+        return raw_loss, adjusted_loss, logits
 
     def eval_step(self, batch: Dict[str, Any], evaluator: Evaluator) -> None:
         # Move tensors to the right device.
@@ -947,16 +1082,18 @@ class Trainer:
         # TODO: max_seq_length 不一样的 batch 如何处理？ 把 model 里面的 use_cache 临时关掉就行
         # Run forward pass.
         with torch.no_grad():  # NOTE: 'torch.inference_mode()' doesn't work with 'torch.compile()'.
-            ce_loss, logits = self.eval_batch(batch)
+            ce_loss, adjusted_ce_loss, logits = self.eval_batch(batch)
 
         # Update metrics.
         evaluator.update_metrics(
-            batch, ce_loss, logits
+            batch, ce_loss, logits, adjusted_ce_loss=adjusted_ce_loss
         )  # batch includes all keys that the downstream evaluation needs
 
         barrier()
 
     def eval_generation_step(self, batch: Dict[str, Any], evaluator: Evaluator) -> None:
+        from .eval.passkey import PasskeyMetric
+
         batch = move_to_device(batch, self.device)
         generation_cfg = None
         for eval_cfg in self.cfg.evaluators:
@@ -1127,7 +1264,13 @@ class Trainer:
             # Get final metrics.
             metrics = evaluator.compute_metrics()
             eval_metrics.update(metrics)
+            for name, value in metrics.items():
+                if name.startswith("eval/") and name.endswith("/Perplexity"):
+                    label = name[len("eval/") : -len("/Perplexity")]
+                    self.latest_eval_perplexity[label] = value
+                    self.eval_perplexity_history.append((float(self.global_step), value))
             self.log_metrics_to_console(f"{evaluator.label}", metrics)
+            self.persist_perplexity_history()
 
             del eval_batches
 
@@ -1151,6 +1294,10 @@ class Trainer:
                 # Next check if early stopping loss criteria is met.
                 should_cancel = True
                 cancel_reason = "early stopping from loss increase"
+            elif self.cfg.cancel_signal_path is not None and Path(self.cfg.cancel_signal_path).exists():
+                should_cancel = True
+                cancel_reason = f"cancel signal file '{self.cfg.cancel_signal_path}'"
+                extra_steps = self.cfg.extra_steps_after_cancel
             elif get_global_rank() == 0 and self.should_log_to_swanlab() and (api_key := os.environ.get("SWANLAB_API_KEY")) is not None:
                 # Finally, check if someone canceled the run from W&B by adding the 'cancel' / 'canceled' tag..
                 # We won't see it in the run object. So we have to use the import/export API to check.
@@ -1303,6 +1450,8 @@ class Trainer:
 
                     # Run train step on batch.
                     metrics = self.train_step(batch, reduce_global_loss=should_log_this_step)
+                    if self._attention_probe is not None:
+                        metrics.update(self._attention_probe.maybe_record(self.global_step))
 
                     # Maybe collect other metrics.
                     if should_log_this_step:
@@ -1458,6 +1607,8 @@ class Trainer:
     def close(self, exit_code: int = 0) -> None:
         gc_cuda()
 
+        if self._attention_probe is not None:
+            self._attention_probe.close()
         if self.indices_file is not None:
             self.indices_file.flush()
             self.indices_file.close()

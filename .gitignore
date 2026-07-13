@@ -1,0 +1,15 @@
+# Checkpoint directories
+workspace/OLMo-*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (large)
+workspace/*.log

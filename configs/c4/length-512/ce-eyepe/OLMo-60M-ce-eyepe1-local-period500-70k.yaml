@@ -1,0 +1,143 @@
+run_name: OLMo-60M-ce-512-eyepe-olmo-c4-period500-70k
+seed: 6198
+dry_run: false
+
+swanlab: null
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 8
+  mlp_ratio: 8
+  weight_tying: false
+  alibi: false
+  rope: true
+  rope_variant: attn_ssm_xpos
+  fourier: false
+  flash_attention: true
+  attention_dropout: 0.0
+  attention_layer_norm: true
+  attention_layer_norm_with_affine: true
+  clip_qkv: null
+  include_bias: false
+  block_type: sequential
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  layer_norm_eps: 1e-6
+  bias_for_layer_norm: false
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 512
+  vocab_size: 50780
+  embedding_size: 50816
+  eos_token_id: 0
+  pad_token_id: 1
+  init_device: cuda
+  init_fn: normal
+  init_std: 0.02
+  init_cutoff_factor: 3
+  attn_ssm_xpos_scale_base: 80
+  attn_ssm_xpos_exp_clip: 80.0
+  attn_ssm_disparity_eta: 1.0
+  attn_ssm_learn_eta: false
+  attn_ssm_center_positions: false
+  attn_ssm_sink_no_decay: false
+
+ddp:
+  grad_sync_mode: batch
+  find_unused_params: false
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 6.0e-4
+  weight_decay: 0.1
+  eps: 1e-8
+  decay_norm_and_bias: true
+  decay_embeddings: true
+  betas:
+    - 0.9
+    - 0.95
+  metrics_log_interval: 10
+
+scheduler:
+  name: cosine_with_warmup
+  t_warmup: 10000
+  alpha_f: 0.1
+  warmup_min_lr: 0
+
+tokenizer:
+  identifier: /mnt/public/code/qintian/AC_RoPE/dataset/olmo_c4/tokenizer.json
+  truncate_direction: right
+
+save_folder: workspace/${run_name}
+remote_save_folder: null
+save_overwrite: true
+save_interval: 2000
+save_interval_unsharded: 2000
+save_num_unsharded_checkpoints_to_keep: 3
+
+load_path: null
+no_pre_train_checkpoint: true
+
+max_duration: 70000
+global_train_batch_size: 1024
+device_train_microbatch_size: 64
+
+precision: amp_bf16
+distributed_strategy: ddp
+
+gen1_gc_interval: 1
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 20
+
+perplexity:
+  ignore_period_surprisal: true
+
+eval_interval: 1000
+eval_subset_num_batches: 64
+device_eval_batch_size: 16
+evaluators:
+  - label: olmo-c4-validation-512
+    type: lm
+    data:
+      num_workers: 0
+      drop_last: true
+      chunk_size: 512
+      paths:
+        - /mnt/public/code/qintian/AC_RoPE/dataset/olmo_c4/part-000-00000.npy
+      sample_range:
+        start: 1675111
+        stop: 1684881
+      token_id_remap:
+        source_token_id: 15
+        replacement_token_start: 50280
+        replacement_token_count: 500
+        seed: 6198
+
+data:
+  memmap_dtype: uint16
+  chunk_size: 512
+  pad_direction: right
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: null
+  persistent_workers: false
+  timeout: 0
+  paths:
+    - /mnt/public/code/qintian/AC_RoPE/dataset/olmo_c4/part-000-00000.npy
+  sample_range:
+    start: 0
+    stop: 1675111
+  token_id_remap:
+    source_token_id: 15
+    replacement_token_start: 50280
+    replacement_token_count: 500
+    seed: 6198

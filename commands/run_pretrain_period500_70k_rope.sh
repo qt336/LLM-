@@ -6,4 +6,4 @@ cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-torchrun --nproc_per_node=8   scripts/train.py   configs/c4/length-512/ce-eyepe/OLMo-60M-ce-eyepe1-local-period-remap.yaml
+torchrun --nproc_per_node=8 scripts/train.py configs/c4/length-512/ce-rope/OLMo-60M-ce-rope-local-period500-70k.yaml

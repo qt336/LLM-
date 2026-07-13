@@ -14,8 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import swanlab
 from packaging import version
+
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,7 +31,6 @@ from olmo.config import (
     TrainConfig,
 )
 from olmo.data import build_train_dataloader
-from olmo.eval import build_evaluators
 from olmo.exceptions import OLMoCliError, OLMoConfigurationError
 from olmo.model import OLMo
 from olmo.optim import BoltOnWarmupScheduler, build_optimizer, build_scheduler
@@ -109,17 +112,20 @@ def main(cfg: TrainConfig) -> None:
     # print(cfg.swanlab.rank_zero_only)
     swanlab_run = None
     if cfg.swanlab is not None and (get_global_rank() == 0 or not cfg.swanlab.rank_zero_only):
-        swanlab_dir = Path(cfg.save_folder) / "swanlab"
-        swanlab_dir.mkdir(parents=True, exist_ok=True)
-        swanlab_run = swanlab.init(
-            dir=swanlab_dir,
-            project=cfg.swanlab.project,
-            entity=cfg.swanlab.entity,
-            group=cfg.swanlab.group,
-            name=cfg.swanlab.name,
-            tags=cfg.swanlab.tags,
-            config=cfg.asdict(exclude=["swanlab"]),
-        )
+        if swanlab is None:
+            log.warning("swanlab is not installed; continuing without swanlab logging")
+        else:
+            swanlab_dir = Path(cfg.save_folder) / "swanlab"
+            swanlab_dir.mkdir(parents=True, exist_ok=True)
+            swanlab_run = swanlab.init(
+                dir=swanlab_dir,
+                project=cfg.swanlab.project,
+                entity=cfg.swanlab.entity,
+                group=cfg.swanlab.group,
+                name=cfg.swanlab.name,
+                tags=cfg.swanlab.tags,
+                config=cfg.asdict(exclude=["swanlab"]),
+            )
     
 
     barrier()
@@ -131,7 +137,11 @@ def main(cfg: TrainConfig) -> None:
     train_loader = build_train_dataloader(cfg)
 
     # Construct evaluators.
-    evaluators = build_evaluators(cfg, device)
+    evaluators = []
+    if cfg.evaluators:
+        from olmo.eval import build_evaluators
+
+        evaluators = build_evaluators(cfg, device)
     barrier()
 
     # Initialize the model.

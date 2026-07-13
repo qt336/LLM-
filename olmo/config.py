@@ -40,6 +40,8 @@ __all__ = [
     "SchedulerType",
     "SchedulerConfig",
     "DataConfig",
+    "SampleRangeConfig",
+    "TokenIdRemapConfig",
     "InstanceFilterConfig",
     "EvaluatorConfig",
     "GenerationEvaluatorConfig",
@@ -52,6 +54,7 @@ __all__ = [
     "WandbConfig",
     "CompilerConfig",
     "WandbConfig",
+    "AttentionProbeConfig",
     "DDPConfig",
     "DistributedStrategy",
     "DDPGradSyncMode",
@@ -989,6 +992,20 @@ class InstanceFilterConfig(BaseConfig):
 
 
 @dataclass
+class TokenIdRemapConfig(BaseConfig):
+    source_token_id: int
+    replacement_token_start: int
+    replacement_token_count: int
+    seed: int = 0
+
+
+@dataclass
+class SampleRangeConfig(BaseConfig):
+    start: int = 0
+    stop: Optional[int] = None
+
+
+@dataclass
 class DataConfig(BaseConfig):
     paths: Optional[List[str]] = None
     memmap_dtype: str = "uint16"
@@ -1007,6 +1024,8 @@ class DataConfig(BaseConfig):
     timeout: int = 0
     seed: Optional[int] = None
     instance_filter: Optional[InstanceFilterConfig] = None
+    sample_range: Optional[SampleRangeConfig] = None
+    token_id_remap: Optional[TokenIdRemapConfig] = None
 
     @property
     def effective_memmap_dtype(self):
@@ -1080,6 +1099,43 @@ class WandbConfig(BaseConfig):
 class SpeedMonitorConfig(BaseConfig):
     window_size: int = 100
     gpu_flops_available: Optional[Union[float, int]] = None
+
+
+@dataclass
+class PerplexityConfig(BaseConfig):
+    ignore_period_surprisal: bool = False
+    """
+    When ``True``, perplexity reporting treats remapped period tokens as having surprisal 0,
+    i.e. token-level perplexity 1. This affects only reported perplexity metrics, not training loss.
+    """
+
+
+@dataclass
+class AttentionProbeConfig(BaseConfig):
+    enabled: bool = False
+    """
+    Whether to run the fixed-prompt attention probe during training.
+    """
+
+    prompt: str = "I have a dog. I have a cat."
+    """
+    Fixed prompt used for the attention probe.
+    """
+
+    output_dir: str = "attention"
+    """
+    Relative directory under ``save_folder`` where probe outputs are written.
+    """
+
+    record_interval: int = 1
+    """
+    How often, in training steps, to record probe attention values.
+    """
+
+    plot_interval: int = 100
+    """
+    How often, in training steps, to refresh the per-head/per-layer plots.
+    """
 
 
 @dataclass
@@ -1527,6 +1583,21 @@ class TrainConfig(BaseConfig):
     Speed monitor configuration.
     """
 
+    perplexity: PerplexityConfig = field(default_factory=PerplexityConfig)
+    """
+    Perplexity reporting configuration.
+    """
+
+    loss_last_token_only: bool = False
+    """
+    If ``True``, compute language-model loss only on the final prediction target in each sequence.
+    """
+
+    attention_probe: Optional[AttentionProbeConfig] = None
+    """
+    Optional fixed-prompt attention probe recorded during training.
+    """
+
     console_log_interval: int = 1
     """
     How often to log to the console.
@@ -1579,6 +1650,13 @@ class TrainConfig(BaseConfig):
     Under certain conditions when a run is canceled we train for a few extra steps after saving
     the final checkpoint so that when the run is restarted from the latest checkpoint we have some
     overlap in metrics.
+    """
+
+    cancel_signal_path: Optional[str] = None
+    """
+    Optional path to a local file used as an external cancel signal. If this file exists during
+    training, the run will be canceled gracefully and continue for ``extra_steps_after_cancel``
+    additional steps before stopping.
     """
 
     early_stopping_factor: Optional[float] = None
